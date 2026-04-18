@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "background-computer-use": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/cua-server",
+      "args": [],
+      "env": {
+        "CUA_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"
+      }
+    }
+  }
+}

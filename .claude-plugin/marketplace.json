@@ -1,0 +1,19 @@
+{
+  "name": "background-computer-use",
+  "owner": {
+    "name": "Madhavan Panchangam"
+  },
+  "metadata": {
+    "description": "Background macOS computer use for Claude Code. Installs an MCP server + skills that let Claude drive other Mac apps without activating them or moving your cursor.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "background-computer-use",
+      "source": "./",
+      "description": "MCP server + app-specific skills for background macOS GUI automation via Accessibility and CGEvent APIs.",
+      "category": "automation",
+      "tags": ["macos", "computer-use", "accessibility", "gui", "background"]
+    }
+  ]
+}

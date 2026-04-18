@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Launcher for the background-computer-use MCP server.
+#
+# On first run this creates a local virtualenv under the plugin root and
+# installs the required PyObjC + MCP dependencies. Subsequent runs reuse
+# the venv and start the stdio MCP server.
+#
+# Claude Code sets CLAUDE_PLUGIN_ROOT automatically for plugin-declared
+# MCP servers. We pass it through as CUA_PLUGIN_ROOT so the server can
+# locate bundled app-instruction files.
+
+set -euo pipefail
+
+PLUGIN_ROOT="${CUA_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+
+if [[ -z "${PLUGIN_ROOT}" ]]; then
+  # Fallback: resolve relative to this script
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
+
+export CUA_PLUGIN_ROOT="${PLUGIN_ROOT}"
+
+VENV_DIR="${PLUGIN_ROOT}/.venv"
+SERVER_PY="${PLUGIN_ROOT}/server/cua_server.py"
+REQS="${PLUGIN_ROOT}/server/requirements.txt"
+STAMP="${VENV_DIR}/.installed-stamp"
+
+PYTHON_BIN="${CUA_PYTHON:-python3}"
+
+log() {
+  echo "[cua-server] $*" 1>&2
+}
+
+if [[ ! -d "${VENV_DIR}" ]]; then
+  log "creating venv at ${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+fi
+
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+
+# Reinstall if requirements.txt has changed since the last install.
+if [[ ! -f "${STAMP}" ]] || [[ "${REQS}" -nt "${STAMP}" ]]; then
+  log "installing/upgrading dependencies from ${REQS}"
+  pip install --quiet --upgrade pip >/dev/null
+  pip install --quiet -r "${REQS}" >/dev/null
+  touch "${STAMP}"
+fi
+
+exec python "${SERVER_PY}"

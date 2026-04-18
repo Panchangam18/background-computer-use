@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments (provisioned on first run by bin/cua-server)
+.venv/
+venv/
+env/
+.env
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Local Claude Code / plugin state
+# (settings.json at repo root is meant to be shared; keep it.
+#  settings.local.json is per-user and must not be committed.)
+.claude/settings.local.json
+.claude/projects/
+.claude/logs/
+
+# Agent / tooling caches generated outside the workspace get ignored by
+# path, but if any hit the repo root, block them here too.
+agent-tools/
