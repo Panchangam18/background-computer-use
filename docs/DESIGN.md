@@ -1,4 +1,4 @@
-# Background Computer Use Notes
+# Background Computer Use Notes (written by Madhavan's Codex)
 
 This README captures everything I can reliably glean from the computer-use capability available in this Codex desktop environment, plus the parts of Anthropic's current Claude Code docs that matter if the goal is to build a Claude plugin with the same background computer-use behavior.
 

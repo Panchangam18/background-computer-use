@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Launcher for the background-computer-use MCP server.
 #
-# On first run this creates a local virtualenv under the plugin root and
-# installs the required PyObjC + MCP dependencies. Subsequent runs reuse
-# the venv and start the stdio MCP server.
+# On first run this creates a local virtualenv next to this script
+# and installs the required PyObjC + MCP dependencies. Subsequent
+# runs reuse the venv and start the stdio MCP server.
 #
-# Claude Code sets CLAUDE_PLUGIN_ROOT automatically for plugin-declared
-# MCP servers. We pass it through as CUA_PLUGIN_ROOT so the server can
-# locate bundled app-instruction files.
+# Works with any MCP client that can spawn a stdio server. Claude
+# Code also exports ${CLAUDE_PLUGIN_ROOT} when this is installed as a
+# Claude Code plugin; we honor that if present but also fall back to
+# inferring the root from this script's location for generic
+# installs.
 
 set -euo pipefail
 

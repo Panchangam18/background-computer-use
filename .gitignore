@@ -28,12 +28,15 @@ build/
 *.egg-info/
 *.egg
 
-# Local Claude Code / plugin state
-# (settings.json at repo root is meant to be shared; keep it.
-#  settings.local.json is per-user and must not be committed.)
+# Local MCP-client state. Different clients use different paths; these
+# are the ones common enough to be worth blocklisting globally. Config
+# files that are meant to be shared (project `.mcp.json`, Claude Code's
+# `.claude/settings.json`) stay tracked.
 .claude/settings.local.json
 .claude/projects/
 .claude/logs/
+.cursor/mcp.json
+.cursor/rules/local/
 
 # Agent / tooling caches generated outside the workspace get ignored by
 # path, but if any hit the repo root, block them here too.

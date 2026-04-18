@@ -1090,7 +1090,7 @@ def _check_ax_permissions() -> None:
         log.warning(
             "Accessibility permission NOT granted. Grant it in "
             "System Settings > Privacy & Security > Accessibility for the process "
-            "running this server (usually your terminal or Claude Code)."
+            "running this server (usually your terminal or the MCP client app)."
         )
 
 

@@ -7,7 +7,13 @@ YYYY-MM-DD. Versions follow [semver](https://semver.org/).
 
 First reasonably-polished release. Most of the fixes below came from
 running the plugin against a dozen real apps in one session and
-patching every footgun I hit.
+patching every footgun I hit. Also reframed the project from "Claude
+Code plugin" to "MCP server + skill library usable with any MCP
+client" — the server and skills were already generic; the docs and
+README were previously Claude-Code-only in tone. Also reframed the project from "Claude
+Code plugin" to "MCP server + skill library usable with any MCP
+client" — the implementation was already generic; the docs were
+previously Claude-Code-only in tone.
 
 ### Added
 
