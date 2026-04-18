@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -99,6 +100,8 @@ try:
         AXUIElementSetAttributeValue,
         AXUIElementPerformAction,
         AXIsProcessTrusted,
+        AXIsProcessTrustedWithOptions,
+        kAXTrustedCheckOptionPrompt,
     )
 except ImportError as exc:  # pragma: no cover - happens only off-macOS
     sys.stderr.write(
@@ -114,6 +117,25 @@ from PIL import Image  # noqa: E402
 # ---------------------------------------------------------------------------
 
 from mcp.server.fastmcp import FastMCP, Image as MCPImage  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import desktop_lease  # noqa: E402
+
+
+def _agent_label() -> str:
+    """Best-effort label identifying this MCP server instance for lease logs.
+
+    Prefers an explicit ``CUA_AGENT_LABEL`` (set by the user or by the
+    parent agent runner), falls back to the client name embedded in the
+    MCP transport env (``MCP_CLIENT_NAME``, not always present), then to
+    ``pid-<n>``. The label is what other agents see in the "desktop
+    busy" error message.
+    """
+    for var in ("CUA_AGENT_LABEL", "MCP_CLIENT_NAME", "CURSOR_AGENT_ID"):
+        v = os.environ.get(var)
+        if v:
+            return v[:64]
+    return f"pid-{os.getpid()}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -666,6 +688,19 @@ def _post_event(event, pid: Optional[int]) -> None:
 _GHOST_SCRIPT = Path(__file__).with_name("cursor_ghost.py")
 _OVERLAY_DISABLED = os.environ.get("CUA_CLICK_OVERLAY", "1") in {"0", "false", "False", "no"}
 
+# Mirror of the ghost's last commanded target position, used to estimate
+# how long the move-to-click animation will take so we can fire the real
+# click at the landing frame (otherwise the click happens before the
+# ghost has animated to the target and the tell is visibly desynced).
+# Initialized to None so the very first click falls back to a fixed
+# short lead-in.
+_GHOST_LAST_POS: Optional[tuple[float, float]] = None
+
+# Import the same Fitts-like duration curve the ghost uses so the
+# server's sleep matches the ghost's actual animation time.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cursor_paths import duration_for_distance as _ghost_move_duration  # noqa: E402
+
 # Lazily-spawned persistent ghost-cursor daemon. It reads commands from its
 # stdin and self-exits a few seconds after the last one -- so as long as the
 # agent keeps making tool calls the ghost stays alive, and it disappears
@@ -690,6 +725,12 @@ def _spawn_ghost() -> Optional[subprocess.Popen]:
                 stderr_target = open(stderr_path, "ab", buffering=0)
             except Exception:
                 stderr_target = subprocess.DEVNULL
+        # Tell the ghost our pid so it can exit when we do. Without this
+        # the ghost would fall back to a long hard-idle timer, which is
+        # fine as a backstop but leaves stale ghosts lingering for up to
+        # 30 minutes after an agent disconnects.
+        env = dict(os.environ)
+        env["CUA_GHOST_PARENT_PID"] = str(os.getpid())
         proc = subprocess.Popen(
             [sys.executable, str(_GHOST_SCRIPT)],
             stdin=subprocess.PIPE,
@@ -697,6 +738,7 @@ def _spawn_ghost() -> Optional[subprocess.Popen]:
             stderr=stderr_target,
             close_fds=True,
             start_new_session=True,
+            env=env,
         )
         return proc
     except Exception as exc:  # pragma: no cover
@@ -731,20 +773,50 @@ def _send_ghost(command: str) -> None:
                 pass
 
 
+def _park_ghost_near(target_pid: int, target_window_id: Optional[int]) -> None:
+    """Tell the ghost which window to drift to after a short idle.
+
+    The ghost's "parked rest position" is the interior of the agent's
+    target app window -- so after a click finishes and the agent pauses
+    (to think / wait for another agent's turn / re-read state), the
+    cursor visibly settles near its own app instead of stranding at
+    whatever pixel it last clicked.
+    """
+    state = _STATE_CACHE.get(int(target_pid))
+    bounds = state.window_bounds if state is not None else None
+    if bounds is None:
+        return
+    x, y, w, h = bounds
+    twid = str(int(target_window_id)) if target_window_id else "0"
+    _send_ghost(f"park {x:.1f} {y:.1f} {w:.1f} {h:.1f} {twid}")
+
+
 def _show_click_overlay(
     x: float,
     y: float,
     target_pid: Optional[int] = None,
+    *,
+    block: bool = True,
 ) -> None:
     """Animate the ghost cursor to ``(x, y)`` and flash a ring on landing.
 
     Talks to the persistent cursor-ghost daemon so the ghost moves smoothly
-    between consecutive clicks and disappears when the agent goes idle.
+    between consecutive clicks and parks near the target app's window
+    when the agent goes idle.
 
     If ``target_pid`` is given, we look up the app's CGWindowID and pass it
     along so the ghost and ring are ordered just above that window, sharing
-    its occlusion with other apps.
+    its occlusion with other apps; we also tell the ghost the window's
+    bounds so it can drift there on idle.
+
+    Call this **before** synthesizing the real click. When ``block`` is
+    True (the default), this function sleeps for approximately the
+    ghost's move-animation duration so the caller's subsequent real
+    click lands in the same frame as the ghost's "press" shrink. The
+    ghost's internal press animation is timed to fire at ~move_dur-50ms,
+    so the real click and the visible press land together.
     """
+    global _GHOST_LAST_POS
     if _OVERLAY_DISABLED:
         return
     target_window_id: Optional[int] = None
@@ -756,15 +828,50 @@ def _show_click_overlay(
         except Exception:
             target_window_id = None
     twid = str(int(target_window_id)) if target_window_id else "0"
+
+    # Estimate the animation time the ghost is about to run. The ghost
+    # uses the same ``duration_for_distance`` curve internally, so this
+    # matches its real on-screen animation within a frame.
+    if _GHOST_LAST_POS is None:
+        # First overlay of the session: the ghost teleports near the
+        # target and animates a short lead-in. Use the minimum duration.
+        move_dur = 0.14
+    else:
+        lx, ly = _GHOST_LAST_POS
+        dist = math.hypot(x - lx, y - ly)
+        move_dur = _ghost_move_duration(dist) if dist > 1.5 else 0.0
+    _GHOST_LAST_POS = (float(x), float(y))
+
     _send_ghost(f"click_at {x:.1f} {y:.1f} 480 {twid}")
+    if target_pid is not None:
+        _park_ghost_near(int(target_pid), target_window_id)
+
+    if block and move_dur > 0.0:
+        # Sleep until the press animation is about to fire inside the
+        # ghost (~move_dur-0.05). The ghost's shrink-then-release pulse
+        # takes ~220ms total; the real click and the visible press will
+        # land within one or two frames of each other.
+        time.sleep(max(0.0, move_dur - 0.05))
 
 
-def _ping_ghost() -> None:
-    """Keep the ghost alive during non-click tool activity so it doesn't
-    fade away while the agent is still actively using other tools."""
+def _ping_ghost(target_pid: Optional[int] = None) -> None:
+    """Keep the ghost alive during non-click tool activity.
+
+    When ``target_pid`` is given (e.g. right after a ``get_app_state``),
+    also refresh the ghost's parked rest position so it can drift to
+    the right app even if no clicks happen.
+    """
     if _OVERLAY_DISABLED:
         return
     _send_ghost("ping")
+    if target_pid is not None:
+        try:
+            state = _STATE_CACHE.get(int(target_pid))
+            title = state.window_title if state is not None else None
+            twid = _cgwindow_id_for_pid(int(target_pid), title)
+        except Exception:
+            twid = None
+        _park_ghost_near(int(target_pid), twid)
 
 
 _BROWSER_JS_DIALECTS: dict[str, str] = {
@@ -1085,13 +1192,98 @@ def _element_center(element: ElementSnapshot) -> Optional[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-def _check_ax_permissions() -> None:
-    if not AXIsProcessTrusted():
-        log.warning(
-            "Accessibility permission NOT granted. Grant it in "
-            "System Settings > Privacy & Security > Accessibility for the process "
-            "running this server (usually your terminal or the MCP client app)."
+def _responsible_gui_app() -> Optional[NSRunningApplication]:
+    """Walk up this process's ancestor chain and return the first ancestor
+    that macOS recognizes as a GUI application.
+
+    That ancestor is the process whose TCC entry actually governs our
+    Accessibility / synthetic-event permissions. For a stdio MCP server
+    spawned by Cursor / Claude Desktop / iTerm / etc., this resolves to
+    the client app bundle -- exactly what the user needs to toggle in
+    System Settings.
+    """
+    pid = os.getpid()
+    # Cap the walk so we don't loop forever on a misreported ppid chain.
+    for _ in range(12):
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            pid = int(out)
+        except Exception:
+            return None
+        if pid <= 1:
+            return None
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if app is not None and app.activationPolicy() == NSApplicationActivationPolicyRegular:
+            return app
+    return None
+
+
+def _ax_permission_message() -> str:
+    """Return a human-readable message explaining how to grant AX permission
+    for *this* server's responsible parent app.
+    """
+    app = _responsible_gui_app()
+    if app is not None:
+        name = app.localizedName() or app.bundleIdentifier() or "the MCP client"
+        bundle = app.bundleIdentifier() or "?"
+        target = f"{name!r} (bundle id {bundle})"
+    else:
+        target = (
+            "the process running this MCP server (usually your MCP client "
+            "app, e.g. Cursor, Claude Desktop, or your terminal emulator)"
         )
+    return (
+        "macOS Accessibility permission is NOT granted to " + target + ". "
+        "Without it, AX trees come back as a single unknown element and "
+        "synthetic clicks/keystrokes are silently dropped.\n\n"
+        "To fix: open System Settings -> Privacy & Security -> Accessibility, "
+        "add the app above (use the + button if it is not listed), and toggle "
+        "it on. You may need to fully quit and relaunch the app afterwards "
+        "so the new permission takes effect in child processes.\n\n"
+        "Shortcut: run `open \"x-apple.systempreferences:com.apple.preference.security?"
+        "Privacy_Accessibility\"` to jump straight to the pane, or call the "
+        "`open_accessibility_settings` MCP tool."
+    )
+
+
+# Cache the startup prompt result so we don't spam-pop the system dialog.
+_AX_PROMPTED = False
+
+
+def _check_ax_permissions(*, prompt: bool = False, raise_on_denied: bool = False) -> bool:
+    """Return True if the server has Accessibility permission.
+
+    When ``prompt`` is True and this is the first call, ask macOS to show
+    the standard "X would like to control your computer" dialog for the
+    responsible parent app. Subsequent calls are silent.
+
+    When ``raise_on_denied`` is True, raise ``ToolError`` with an
+    actionable message instead of returning False. Use this inside
+    AX-dependent MCP tools so the *model* sees the real reason its last
+    call returned an empty tree.
+    """
+    global _AX_PROMPTED
+    trusted: bool
+    if prompt and not _AX_PROMPTED:
+        try:
+            options = {kAXTrustedCheckOptionPrompt: True}
+            trusted = bool(AXIsProcessTrustedWithOptions(options))
+        except Exception:
+            trusted = bool(AXIsProcessTrusted())
+        _AX_PROMPTED = True
+    else:
+        trusted = bool(AXIsProcessTrusted())
+
+    if not trusted:
+        msg = _ax_permission_message()
+        if raise_on_denied:
+            raise ToolError(msg)
+        log.warning(msg.replace("\n\n", " "))
+    return trusted
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1291,42 @@ def _check_ax_permissions() -> None:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("background-computer-use")
+
+
+# --- Desktop-lease decorator -------------------------------------------------
+#
+# Every *mutating* tool (click, drag, press_key, scroll, set_value,
+# type_text, perform_secondary_action) needs to hold the desktop lease
+# for the duration of its work -- otherwise two agents sharing this Mac
+# would interleave keystrokes and cursor moves. ``list_apps`` and
+# ``get_app_state`` intentionally skip the lease because they're
+# read-only and safe to run concurrently.
+#
+# ``@_requires_desktop`` applied *below* ``@mcp.tool()`` so FastMCP
+# registers the wrapped function. If an explicit ``acquire_desktop``
+# call has already parked a lease in the process-global slot, the
+# ``guard`` context manager reuses it; otherwise we take a short-lived
+# lease just for this tool invocation.
+
+import functools as _functools  # noqa: E402
+
+
+def _requires_desktop(fn):
+    @_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Every mutating tool needs Accessibility permission -- both for
+        # AX reads (finding the target element) and for CGEvent-based
+        # synthetic mouse/keyboard events (which macOS drops silently
+        # from unpermissioned processes). Raise a clear, actionable
+        # error instead of letting the caller discover this via a
+        # mysteriously empty tree or a no-op click.
+        _check_ax_permissions(raise_on_denied=True)
+        try:
+            with desktop_lease.guard(agent_label=_agent_label()):
+                return fn(*args, **kwargs)
+        except desktop_lease.DesktopBusy as exc:
+            raise ToolError(str(exc)) from exc
+    return wrapper
 
 
 @mcp.tool()
@@ -1110,7 +1338,9 @@ def list_apps() -> str:
     model can pick an app for subsequent tool calls. The ``app`` argument on
     every other tool accepts either the display name or the bundle identifier.
     """
-    _check_ax_permissions()
+    # list_apps only reads NSWorkspace's running-app roster, which does not
+    # require AX permission. Still warn so the log captures the state.
+    _check_ax_permissions(raise_on_denied=False)
     lines: list[str] = []
     for proc in _running_apps():
         name = proc.localizedName() or "?"
@@ -1144,7 +1374,7 @@ def get_app_state(app: str) -> list[Any]:
     Args:
         app: App display name or bundle identifier.
     """
-    _check_ax_permissions()
+    _check_ax_permissions(raise_on_denied=True)
     proc = _resolve_app(app)
     if proc is None:
         raise ToolError(
@@ -1214,6 +1444,15 @@ def get_app_state(app: str) -> list[Any]:
         window_bounds=bounds,
     )
     _STATE_CACHE[pid] = state
+
+    # Teach the ghost cursor where this agent's app lives so it can
+    # drift there when the agent goes idle. Cheap, and it means the
+    # ghost picks the right rest spot even before the first click.
+    try:
+        twid = _cgwindow_id_for_pid(pid, window_title)
+        _park_ghost_near(pid, twid)
+    except Exception:
+        pass
 
     rendered = _render_state(state)
     # Include per-app instructions if bundled.
@@ -1297,6 +1536,7 @@ def _resolve_target(app: str) -> tuple[int, str]:
 
 
 @mcp.tool()
+@_requires_desktop
 def click(
     app: str,
     element_index: Optional[int] = None,
@@ -1338,10 +1578,15 @@ def click(
             and mouse_button == "left"
             and "AXPress" in el.actions
         ):
+            # Animate the ghost to the element's center first so the
+            # visible press pulse lines up with when AXPress actually
+            # activates the control. AXPress is instant on the real app
+            # side, so if we fire it before the ghost has arrived the
+            # button visibly depresses well before the cursor lands.
+            if element_center is not None:
+                _show_click_overlay(*element_center, target_pid=pid)
             err = AXUIElementPerformAction(el.ax_ref, "AXPress")
             if err == AX_SUCCESS:
-                if element_center is not None:
-                    _show_click_overlay(*element_center, target_pid=pid)
                 return (
                     f"AXPress on element {element_index} ({el.role}"
                     f"{(' ' + repr(el.title)) if el.title else ''}) in pid {pid}"
@@ -1364,10 +1609,16 @@ def click(
     # call either errors with ``-10005 noWindowsAvailable`` or returns the
     # "menu bar 1" hit-test fallback; either way we drop down to the CGEvent
     # path below (which is at least no worse).
+    # Animate the ghost to the target *before* firing the synthetic
+    # click so the press-pulse tell lands together with the real click.
+    # ``_show_click_overlay`` blocks for the ghost's move-animation
+    # duration (matched to the same Fitts curve the daemon uses
+    # internally), then returns.
+    _show_click_overlay(target_xy[0], target_xy[1], target_pid=pid)
+
     if click_count == 1 and mouse_button == "left":
         ok, info = _applescript_click(process_name, target_xy[0], target_xy[1])
         if ok:
-            _show_click_overlay(target_xy[0], target_xy[1], target_pid=pid)
             return (
                 f"left click x1 at ({target_xy[0]:.0f},{target_xy[1]:.0f}) "
                 f"via AppleScript on {process_name!r} (pid {pid}) -> {info}"
@@ -1375,7 +1626,6 @@ def click(
         log.info("AppleScript click did not land (%s); falling back to CGEvent post", info)
 
     _post_click(pid, target_xy[0], target_xy[1], mouse_button, click_count)
-    _show_click_overlay(target_xy[0], target_xy[1], target_pid=pid)
     return (
         f"{mouse_button} click x{click_count} at ({target_xy[0]:.0f},{target_xy[1]:.0f}) "
         f"posted to pid {pid}"
@@ -1383,6 +1633,7 @@ def click(
 
 
 @mcp.tool()
+@_requires_desktop
 def drag(app: str, from_x: float, from_y: float, to_x: float, to_y: float) -> str:
     """Drag the left mouse button from one coordinate to another within ``app``.
 
@@ -1418,6 +1669,7 @@ _FOREGROUND_STEALING_ACTIONS: frozenset[str] = frozenset({
 
 
 @mcp.tool()
+@_requires_desktop
 def perform_secondary_action(
     app: str,
     element_index: int,
@@ -1471,6 +1723,7 @@ def perform_secondary_action(
 
 
 @mcp.tool()
+@_requires_desktop
 def press_key(
     app: str,
     key: str,
@@ -1599,6 +1852,7 @@ def _scroll_position(state: Optional["AppState"], el: ElementSnapshot) -> Option
 
 
 @mcp.tool()
+@_requires_desktop
 def scroll(
     app: str,
     element_index: int,
@@ -1990,6 +2244,7 @@ def _type_into_field(pid: int, el: ElementSnapshot, value: str, submit: bool) ->
 
 
 @mcp.tool()
+@_requires_desktop
 def set_value(
     app: str,
     element_index: int,
@@ -2105,6 +2360,7 @@ def set_value(
 
 
 @mcp.tool()
+@_requires_desktop
 def type_text(
     app: str,
     text: str,
@@ -2147,6 +2403,150 @@ def type_text(
     return f"typed {len(text)} chars{suffix} into pid {pid}{focused_note}"
 
 
+# ---------------------------------------------------------------------------
+# Desktop-lease tools (explicit long-lived hold across multiple turns)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def acquire_desktop(
+    reason: str = "",
+    ttl_s: float = 30.0,
+    wait_s: float = 8.0,
+) -> str:
+    """Hold the desktop exclusively across multiple subsequent tool calls.
+
+    Most agents never need this -- every mutating tool (click, type_text,
+    etc.) already takes a brief lease for the duration of that single
+    call, so uncoordinated calls from different agents serialize cleanly.
+    Call this only when you need **atomicity across calls**: e.g., open
+    a menu, re-read state, click a specific submenu item, all without
+    another agent slipping in between.
+
+    Pair every successful ``acquire_desktop`` with a ``release_desktop``
+    (or let the TTL expire) so other agents aren't blocked forever. If
+    the caller crashes, the kernel releases the underlying lock and the
+    desktop becomes available again.
+
+    Args:
+        reason: Short human-readable note shown to other agents that
+            try to acquire while you hold the lease (e.g., ``"filling
+            out a multi-step Safari form"``).
+        ttl_s: Maximum seconds this lease can stay held before being
+            reclaimable by another agent. Default 30s; cap is enforced
+            on the next ``acquire`` attempt by another process.
+        wait_s: Seconds to wait for the desktop to become free if it's
+            already held. Default 8s.
+    """
+    label = _agent_label()
+    if reason:
+        label = f"{label} ({reason[:80]})"
+    existing = desktop_lease.held_by_this_process()
+    if existing is not None:
+        return (
+            f"already held by this process as {existing.agent_label!r}; "
+            "release_desktop() first to re-acquire with a new reason."
+        )
+    try:
+        lease = desktop_lease.acquire(label, ttl_s=ttl_s, wait_s=wait_s)
+    except desktop_lease.DesktopBusy as exc:
+        raise ToolError(str(exc)) from exc
+    desktop_lease.hold_explicit(lease)
+    return (
+        f"desktop acquired as {label!r} (ttl {ttl_s:.0f}s). "
+        "Call release_desktop() when done."
+    )
+
+
+@mcp.tool()
+def release_desktop() -> str:
+    """Release a previously-acquired long-lived desktop lease.
+
+    Safe to call if you don't currently hold a lease (returns a no-op
+    message in that case). Short per-call leases taken automatically by
+    ``click``/``type_text``/etc. don't need to be released -- they
+    release themselves when the tool call returns.
+    """
+    lease = desktop_lease.release_explicit()
+    if lease is None:
+        return "no explicit desktop lease was held by this process."
+    held_s = time.time() - lease.acquired_at
+    return f"released desktop ({lease.agent_label!r}, held {held_s:.1f}s)."
+
+
+@mcp.tool()
+def desktop_status() -> str:
+    """Report which agent (if any) currently holds the desktop lease.
+
+    Useful for a subagent to check before attempting a long operation:
+    ``desktop_status`` is read-only and does not itself take the lease.
+    """
+    holder = desktop_lease.current_holder()
+    if holder is None:
+        return "desktop: free."
+    since = time.time() - float(holder.get("acquired_at", time.time()))
+    return (
+        f"desktop: held by {holder.get('agent_label', '?')!r} "
+        f"(pid {holder.get('pid', '?')}) for {since:.1f}s."
+    )
+
+
+@mcp.tool()
+def check_accessibility_permission() -> str:
+    """Report whether this MCP server has macOS Accessibility permission.
+
+    Without Accessibility permission, ``get_app_state`` returns a
+    stripped single-element tree for every app and synthetic clicks /
+    keystrokes are silently dropped by macOS. Call this tool if the
+    accessibility tree unexpectedly looks empty across multiple apps
+    -- the returned message identifies exactly which app bundle needs
+    to be toggled on in System Settings -> Privacy & Security ->
+    Accessibility.
+    """
+    if _check_ax_permissions(raise_on_denied=False):
+        app = _responsible_gui_app()
+        label = (
+            f"{app.localizedName()!r} ({app.bundleIdentifier()})"
+            if app is not None
+            else "this process"
+        )
+        return f"OK: Accessibility permission is granted to {label}."
+    return _ax_permission_message()
+
+
+@mcp.tool()
+def open_accessibility_settings() -> str:
+    """Open System Settings at Privacy & Security -> Accessibility.
+
+    Useful when the agent has detected that Accessibility permission is
+    missing and wants to guide the user to the right pane without
+    making them navigate manually.
+    """
+    url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    try:
+        subprocess.Popen(
+            ["open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as exc:
+        raise ToolError(f"failed to open System Settings: {exc}") from exc
+    app = _responsible_gui_app()
+    if app is not None:
+        name = app.localizedName() or app.bundleIdentifier() or "the MCP client"
+        return (
+            f"Opened Privacy & Security -> Accessibility. Add/enable {name!r} "
+            "in the list, then fully quit and relaunch it so child processes "
+            "inherit the new permission."
+        )
+    return (
+        "Opened Privacy & Security -> Accessibility. Enable the app that "
+        "runs this MCP server (your MCP client or terminal emulator)."
+    )
+
+
 _PLAYGROUND_SCRIPT = Path(__file__).with_name("cursor_playground.py")
 
 
@@ -2183,7 +2583,10 @@ def open_cursor_playground() -> str:
 
 def main() -> None:
     log.info("starting %s (plugin root: %s)", CUA_VERSION, PLUGIN_ROOT)
-    _check_ax_permissions()
+    # On first startup, ask macOS to show the standard Accessibility
+    # prompt for our responsible parent (Cursor / Claude Desktop / etc.)
+    # if we don't already have permission. This is a no-op when trusted.
+    _check_ax_permissions(prompt=True)
     mcp.run()
 
 

@@ -120,6 +120,30 @@ With the server loaded in your MCP client:
 All of the above happen without activating the target app. Your
 cursor stays where it is.
 
+## Ghost cursor
+
+While the agent works, a translucent "ghost" cursor animates to each
+click target and pulses on landing so you can follow along without
+losing focus of your real cursor. Two cursor styles ship built in:
+
+- `default` — a bold blue arrow with a white outline (used by default).
+- `claude` — the Claude logo.
+
+You can also point `CUA_CURSOR` at any SVG/PNG on disk.
+
+Each MCP client gets its own ghost cursor that persists for the life
+of its server process. After ~1.5s of inactivity the ghost drifts
+toward the interior of whichever app window the agent is currently
+working with, so when multiple agents share this Mac each cursor
+visibly "belongs to" its own app instead of all piling up on the last
+click location. The ghost exits automatically when its parent server
+process dies.
+
+See [`docs/DEVELOPING.md`](docs/DEVELOPING.md#environment-variables)
+for the related env vars (`CUA_CURSOR`, `CUA_CURSOR_HOTSPOT`,
+`CUA_CLICK_PRESS_SCALE`, `CUA_CLICK_RING`, `CUA_CLICK_OVERLAY`,
+`CUA_GHOST_PARK_IDLE_S`, `CUA_GHOST_HARD_IDLE_S`).
+
 ## Tool surface
 
 | Tool | Purpose |
@@ -133,6 +157,34 @@ cursor stays where it is.
 | `scroll(app, element_index, direction, pages=1, smooth=True)` | Smooth, multi-page scroll. Tries AX `AXScroll*ByPage`, then scroll-bar `AXValue`, then Chromium AppleScript JS, then pixel wheel events. Refuses to silently steal focus. |
 | `set_value(app, element_index, value, submit=True)` | Set an AX value. Auto-falls-back to a `cmd+a` → `type_text` → `Return` typing sequence for Safari's URL bar and other sticky text fields. |
 | `type_text(app, text, element_index=…)` | Freeform Unicode typing via synthetic keyboard events. |
+| `acquire_desktop(reason, ttl_s=30, wait_s=8)` | Hold the desktop exclusively across multiple tool calls so another agent can't slip in between your turns. See [Multiple agents](#multiple-agents-on-one-mac) below. |
+| `release_desktop()` | Release a previously-acquired long-lived lease. |
+| `desktop_status()` | Read-only: report which agent currently holds the desktop (if any). |
+| `check_accessibility_permission()` | Diagnostic: confirm whether macOS Accessibility permission is granted, and if not, name the exact app bundle the user needs to toggle on. |
+| `open_accessibility_settings()` | Open System Settings at Privacy & Security → Accessibility so the user can grant permission without hunting for the pane. |
+
+## Multiple agents on one Mac
+
+The physical Mac desktop is a singleton peripheral — one keyboard, one
+mouse, one focus — so multiple MCP clients (or subagents) sharing this
+server can't literally act in parallel, but they *can* take turns
+without stepping on each other. Every mutating tool call
+(`click`, `drag`, `type_text`, `press_key`, `scroll`, `set_value`,
+`perform_secondary_action`) automatically acquires a brief
+cross-process lease backed by `flock` on `/tmp/cua-desktop.lock`.
+Uncoordinated calls from different agents serialize cleanly — one
+runs, the other waits up to `CUA_LEASE_DEFAULT_WAIT_S` (default 8s)
+and then raises a "desktop busy: held by 'agent-X'" error.
+
+For multi-step sequences that must be atomic (open menu → re-read
+state → pick a submenu item), call `acquire_desktop` first and
+`release_desktop` when done. The underlying lock is released
+automatically if your process crashes, so a dead agent never wedges
+the desktop permanently. Set `CUA_AGENT_LABEL` in your MCP client's
+env block to give your agent a readable name in contention errors.
+
+Read-only tools (`list_apps`, `get_app_state`, `desktop_status`) do
+not take the lease and can be called by any agent at any time.
 
 ## Principles
 

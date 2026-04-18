@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 70 90" width="70" height="90">
+  <!-- Arrow pointer with its tip anchored at (3, 3). The cursor
+       hotspot is configured in cursor_ghost.py to match: fractions
+       (3/70, 3/90). Top-left inset keeps the white stroke fully
+       inside the viewBox instead of being clipped at the edge. -->
+  <path d="M3 3
+           L59 33
+           Q64 36 58 39
+           L36 43
+           Q33 44 32 47
+           L23 81
+           Q21 86 18 81
+           L3 11
+           Q2 3 3 3 Z"
+        fill="#1f6feb"
+        stroke="#ffffff"
+        stroke-width="4"
+        stroke-linejoin="round"
+        stroke-linecap="round"/>
+</svg>

@@ -77,6 +77,49 @@ The launcher and server read:
   edge is at most this many pixels (default `1600`).
 - `CUA_CLICK_OVERLAY` — set to `0`/`false` to disable the ghost-cursor
   visualization that runs during tool calls (default: enabled).
+- `CUA_CURSOR` — which cursor image the ghost uses. Accepts a built-in
+  name (`default` — bold black click-pointer with sparkle marks, shown
+  by default; `claude` — the Claude logo) or an absolute path to your
+  own SVG/PNG. Default `default`.
+- `CUA_CURSOR_HOTSPOT` — `"fx,fy"` fractions (0..1) that locate the
+  pointer tip inside the cursor image. Only needed for custom cursors
+  whose tip isn't at the top-left (the default). Example: `0.5,0.5`
+  for a centered hotspot.
+- `CUA_CLICK_PRESS_SCALE` — how far the cursor shrinks on click
+  (default `0.7`; i.e. 70% size). Set to `1.0` to disable the press
+  animation.
+- `CUA_CLICK_RING` — set to `0`/`false` to suppress the blue ring
+  flash on click and rely only on the cursor-shrink animation
+  (default: enabled).
+- `CUA_GHOST_PARK_IDLE_S` — seconds of no tool-call activity before the
+  ghost drifts from its last click location to the interior of its
+  target app's window. Default `1.5`. The "park" behavior makes each
+  agent's cursor visibly "belong to" its app when multiple agents are
+  sharing the Mac. Set to a very large number to disable.
+- `CUA_GHOST_Z_TRACK_S` — how often the ghost re-asserts its z-order
+  relative to its target app's window. Default `0.15` (150 ms), so
+  when the user Cmd-Tabs to the target app the ghost rises with it
+  (and drops behind when another app is raised above the target).
+- `CUA_GHOST_HARD_IDLE_S` — hard-idle backstop that self-exits the
+  ghost after this many seconds of no commands, in case the
+  parent-process-watch path somehow fails. Default `1800` (30 min);
+  normally you never hit this because the ghost exits as soon as its
+  parent server process dies.
+- `CUA_AGENT_LABEL` — human-readable name for this server instance
+  shown to other agents in "desktop busy: held by 'agent-X'" errors.
+  Defaults to `MCP_CLIENT_NAME`, then `CURSOR_AGENT_ID`, then
+  `pid-<n>`. Recommended when running multiple MCP clients against
+  the same Mac.
+- `CUA_LEASE_DIR` — directory for the desktop-lease lock file and
+  holder metadata. Default `/tmp`. Only relevant if multiple Mac
+  users (separate logins) are each running the server and you want
+  them to contend on the same lock.
+- `CUA_LEASE_DEFAULT_TTL_S` — how long an implicit per-call lease is
+  considered live before another process can reclaim it if the
+  holding process appears dead. Default `30` seconds.
+- `CUA_LEASE_DEFAULT_WAIT_S` — how long `click`/`type_text`/etc.
+  wait for a contended lease before failing with `ToolError`.
+  Default `8` seconds.
 
 ## Ghost cursor playground
 
@@ -95,10 +138,19 @@ red `X` in the top-left to exit.
 
 - **"No captured app state for this app."** — call `get_app_state(app)`
   first. Element indexes are scoped to the most recent snapshot.
-- **Empty accessibility tree / `AXIsProcessTrusted` warning** —
-  Accessibility permission is not granted to the process running your
-  MCP client. Toggle it off and back on after granting, then fully
-  restart the client.
+- **Empty accessibility tree across every app / every tool call fails
+  with "macOS Accessibility permission is NOT granted"** —
+  Accessibility permission is not granted to the GUI app that
+  launched your MCP client (Cursor, Claude Desktop, iTerm, etc.). Call
+  the `check_accessibility_permission` tool — it identifies the exact
+  bundle id that needs to be toggled. Then either run
+  `open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"`
+  or call the `open_accessibility_settings` tool to jump to the pane.
+  Enable the app, then **fully quit and relaunch it** (not just close
+  the window) so child processes inherit the new permission. On first
+  startup the server also asks macOS to show the standard "would like
+  to control your computer" prompt; dismissing it without granting
+  access lands you in this state.
 - **Clicks seem to go nowhere** — many apps silently drop
   `CGEventPostToPid` events when they lack focus and the target
   element is inside a heavy WebView. Fall back to `AXPress` via
@@ -132,6 +184,10 @@ red `X` in the top-left to exit.
   cursor that appears during tool calls.
 - `server/cursor_paths.py` — bezier-path sampling for the ghost.
 - `server/cursor_playground.py` — stand-alone dev playground.
+- `server/desktop_lease.py` — cross-process `flock`-based mutex that
+  serializes mutating tool calls from concurrent MCP clients so they
+  don't stomp on each other's keystrokes. Exposes the
+  `acquire_desktop`/`release_desktop`/`desktop_status` MCP tools.
 - `server/app-hints/<App>.md` — app-specific behavioral notes that
   get injected as `<app_hints>` in the `get_app_state` response for
   that app. Picked by bundle id or display name via the

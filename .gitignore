@@ -35,9 +35,12 @@ build/
 .claude/settings.local.json
 .claude/projects/
 .claude/logs/
+.claude/worktrees/
 .cursor/mcp.json
 .cursor/rules/local/
 
 # Agent / tooling caches generated outside the workspace get ignored by
 # path, but if any hit the repo root, block them here too.
 agent-tools/
+
+background-computer-use.zip
