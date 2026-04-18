@@ -41,7 +41,7 @@ per-app hint files grow as I hit new quirks. See
 ### As a plugin marketplace
 
 ```text
-/plugin marketplace add madhavan/background-computer-use
+/plugin marketplace add Panchangam18/background-computer-use
 /plugin install background-computer-use@background-computer-use
 ```
 
@@ -57,7 +57,7 @@ Or, if you've cloned the repo locally:
 Skip the marketplace and point Claude Code at this directory directly:
 
 ```bash
-git clone https://github.com/madhavan/background-computer-use.git
+git clone https://github.com/Panchangam18/background-computer-use.git
 cd background-computer-use
 claude --plugin-dir .
 ```
